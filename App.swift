@@ -141,13 +141,15 @@ func refine(_ mask: CIImage, _ s: Settings) -> CIImage {
     return m
 }
 
-// Compresión 0–1: hasta 0.5 baja colores 256→32; de 0.5 a 1 además baja resolución 100%→30%
+// Compresión 0–1, progresiva: colores 256→16 y resolución 100%→30% a la vez. 0 = PNG original
 func compressionParams(_ c: Double) -> (colors: Int?, scale: Double) {
     if c <= 0 { return (nil, 1) }
-    let colors = Int((256 * pow(32.0 / 256, min(c, 0.5) / 0.5)).rounded())
-    let scale = c <= 0.5 ? 1 : 1 - (c - 0.5) / 0.5 * 0.7
-    return (colors, scale)
+    let colors = max(2, Int((256 * pow(16.0 / 256, c)).rounded()))
+    return (colors, 1 - 0.7 * c)
 }
+
+// Puntos de muestra para estimar el peso mientras se mueve el slider
+let sampleLevels = [0, 0.25, 0.5, 0.75, 1.0]
 
 let pngquantPath = "/opt/homebrew/bin/pngquant"
 
@@ -273,7 +275,9 @@ final class Model: ObservableObject {
     enum Packaging { case loose, folder, zip }
     @Published var exportStep = ExportStep.none
     @Published var compression: [UUID: Double] = [:]  // por imagen, 0 = PNG original
-    @Published var sizes: [UUID: Int] = [:]  // bytes reales por imagen
+    @Published var sizes: [UUID: Int] = [:]      // bytes reales con la compresión actual
+    @Published var samples: [UUID: [Int]] = [:]  // bytes en cada sampleLevel, para estimar en vivo
+    private var sizeLevel: [UUID: Double] = [:]  // compresión con la que se calculó sizes
     @Published var expanded: UUID?  // fila con el slider abierto por click
     @Published var hovered: UUID?
     private var exportDir: URL?  // nil = junto a cada original
@@ -283,6 +287,7 @@ final class Model: ObservableObject {
     func choosePackaging(_ p: Packaging) {
         packaging = p
         exportStep = .compression
+        computeSamples()
         computeSizes()
     }
 
@@ -291,16 +296,38 @@ final class Model: ObservableObject {
         for item in items where ids?.contains(item.id) ?? true {
             let generation = (sizesGeneration[item.id] ?? 0) + 1
             sizesGeneration[item.id] = generation
-            sizes[item.id] = nil
             let c = compression[item.id] ?? 0
             Task.detached {
                 guard let out = cutout(item, item.settings), let data = encode(out, compression: c) else { return }
                 await MainActor.run {
                     guard generation == self.sizesGeneration[item.id] else { return }
                     self.sizes[item.id] = data.count
+                    self.sizeLevel[item.id] = c
                 }
             }
         }
+    }
+
+    // Codifica cada imagen en los niveles de muestra (una vez al entrar al paso)
+    func computeSamples() {
+        samples = [:]
+        for item in items {
+            Task.detached {
+                guard let out = cutout(item, item.settings) else { return }
+                let bytes = sampleLevels.map { encode(out, compression: $0)?.count ?? 0 }
+                await MainActor.run { self.samples[item.id] = bytes }
+            }
+        }
+    }
+
+    // Peso exacto si ya se calculó para esta compresión; si no, interpolado entre muestras
+    func displaySize(_ id: UUID) -> Int? {
+        let c = compression[id] ?? 0
+        if let exact = sizes[id], sizeLevel[id] == c { return exact }
+        guard let s = samples[id] else { return nil }
+        let i = min(Int(c / 0.25), sampleLevels.count - 2)
+        let t = (c - sampleLevels[i]) / 0.25
+        return Int(Double(s[i]) + (Double(s[i + 1]) - Double(s[i])) * t)
     }
 
     func chooseDestination(_ dir: URL?) {
@@ -407,14 +434,15 @@ struct ContentView: View {
             }
         case .compression:
             StepView(title: "Tamaño", step: 3, backTitle: "Atrás", back: { model.exportStep = .packaging }) {
-                List(model.items.sorted { (model.sizes[$0.id] ?? 0) > (model.sizes[$1.id] ?? 0) }) { item in
+                // Orden fijo por peso original, para que las filas no salten al comprimir
+                List(model.items.sorted { (model.samples[$0.id]?[0] ?? 0) > (model.samples[$1.id]?[0] ?? 0) }) { item in
                     SizeRow(model: model, item: item)
                 }
                 .accessibilityIdentifier("size-list")
                 HStack {
                     Text("Total").bold()
                     Spacer()
-                    Text(mb(model.sizes.values.reduce(0, +))).bold().monospacedDigit()
+                    Text(mb(model.items.compactMap { model.displaySize($0.id) }.reduce(0, +))).bold().monospacedDigit()
                 }
                 Text("Click o hover en una imagen para comprimirla")
                     .font(.callout).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
@@ -559,25 +587,29 @@ struct SizeRow: View {
     var body: some View {
         let c = model.compression[item.id] ?? 0
         let (colors, scale) = compressionParams(c)
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(item.url.deletingPathExtension().lastPathComponent).lineLimit(1).truncationMode(.middle)
-                Spacer()
-                if let bytes = model.sizes[item.id] { Text(mb(bytes)).monospacedDigit() }
+        let active = model.expanded == item.id || model.hovered == item.id
+        HStack(spacing: 10) {
+            Text(item.url.deletingPathExtension().lastPathComponent).lineLimit(1).truncationMode(.middle)
+            Spacer(minLength: 8)
+            // Siempre ocupa su lugar (solo cambia la opacidad) para que la fila no cambie de tamaño
+            Slider(value: Binding(get: { c }, set: { model.compression[item.id] = $0 }), in: 0...1,
+                   onEditingChanged: { editing in if !editing { model.computeSizes([item.id]) } })
+                .controlSize(.small)
+                .frame(width: 130)
+                .opacity(active ? 1 : 0)
+                .disabled(!active)
+                .help(colors.map { "\($0) colores · resolución \(Int(scale * 100))%" } ?? "PNG original")
+                .accessibilityIdentifier("compression-slider-\(item.id)")
+            Text(c > 0 ? "−\(Int(c * 100))%" : "")
+                .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                .frame(width: 34, alignment: .trailing)
+            Group {
+                if let bytes = model.displaySize(item.id) { Text(mb(bytes)).monospacedDigit() }
                 else { ProgressView().controlSize(.small) }
             }
-            if model.expanded == item.id || model.hovered == item.id {
-                Slider(value: Binding(get: { c }, set: { model.compression[item.id] = $0 }), in: 0...1, step: 0.05,
-                       onEditingChanged: { editing in if !editing { model.computeSizes([item.id]) } }) {
-                    Text("Compresión \(Int(c * 100))%").frame(width: 120, alignment: .leading)
-                }
-                .accessibilityIdentifier("compression-slider-\(item.id)")
-                Text(colors.map { "\($0) colores" } ?? "Colores originales")
-                    + Text(" · resolución \(Int(scale * 100))%")
-            }
+            .frame(width: 72, alignment: .trailing)
         }
-        .font(.body)
-        .padding(.vertical, 2)
+        .frame(height: 24)
         .contentShape(Rectangle())
         .onHover { model.hovered = $0 ? item.id : (model.hovered == item.id ? nil : model.hovered) }
         .onTapGesture { model.expanded = model.expanded == item.id ? nil : item.id }
